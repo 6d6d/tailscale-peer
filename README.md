@@ -1,87 +1,98 @@
-# Tailscale
+# tailscale-peer-relay
 
-https://tailscale.com
+在 `6d6d/tailscale-peer` 的 `relay-server` 分支上用 GitHub Actions 构建带
+peer relay server 支持的 Tailscale 容器镜像。
 
-Private WireGuard® networks made easy
+## 分支内容
 
-## Overview
+branch `relay-server`（已推送）：
 
-This repository contains the majority of Tailscale's open source code.
-Notably, it includes the `tailscaled` daemon and
-the `tailscale` CLI tool. The `tailscaled` daemon runs on Linux, Windows,
-[macOS](https://tailscale.com/kb/1065/macos-variants/), and to varying degrees
-on FreeBSD and OpenBSD. The Tailscale iOS and Android apps use this repo's
-code, but this repo doesn't contain the mobile GUI code.
+- `46596c8` `cmd/containerboot: support peer relay server configuration`
+  （取自 `truppelito/tailscale` 的分支，原样保留，含 435 行新增测试）
+  - 新增环境变量 `TS_RELAY_SERVER_PORT`、`TS_RELAY_SERVER_STATIC_ENDPOINTS`
+  - 新增 `appendRelayServerSetArgs` / `tailscaleSetRelayServer`，把这两个
+    set-only 参数用 `tailscale set` 下发（`tailscale up` 不接受它们）
+  - `TS_EXTRA_ARGS` 里若混入了这两个参数，会被摘出来单独处理
+- `c522d42` `ci: build a container image with containerboot peer relay server support`
+  - `Dockerfile.relay`
+  - `.github/workflows/build-relay-image.yml`
 
-Other [Tailscale repos](https://github.com/orgs/tailscale/repositories) of note:
+## 镜像
 
-* the Android app is at https://github.com/tailscale/tailscale-android
-* the Synology package is at https://github.com/tailscale/tailscale-synology
-* the QNAP package is at https://github.com/tailscale/tailscale-qpkg
-* the Chocolatey packaging is at https://github.com/tailscale/tailscale-chocolatey
+- `ghcr.io/6d6d/tailscale-peer:relay-latest`
+- `ghcr.io/6d6d/tailscale-peer:relay-1.103.0`
+- `ghcr.io/6d6d/tailscale-peer:relay-1.103.0-relay.<短 SHA>`
 
-For background on which parts of Tailscale are open source and why,
-see [https://tailscale.com/opensource/](https://tailscale.com/opensource/).
+平台：`linux/amd64`、`linux/arm64`（`workflow_dispatch` 的 `platforms` 输入可改）。
 
-## Using
+与官方 `tailscale/tailscale` 镜像一致的部分：三个二进制（`tailscale`、
+`tailscaled`、`containerboot`）、同样的 ldflags 版本戳、
+`-tags=ts_kube,ts_package_container`、同样的基础包（含 legacy iptables 链接）、
+入口点 `/usr/local/bin/containerboot`。
 
-We serve packages for a variety of distros and platforms at
-[https://pkgs.tailscale.com](https://pkgs.tailscale.com/).
+`Dockerfile.relay` 相对官方构建方式的唯一差别：Go 构建阶段固定在
+`$BUILDPLATFORM` 并交叉编译 `$TARGETARCH`（多架构不走 QEMU 全量模拟），
+显式 `CGO_ENABLED=0`。
 
-## Other clients
+## 触发方式
 
-The [macOS, iOS, and Windows clients](https://tailscale.com/download)
-use the code in this repository but additionally include small GUI
-wrappers. The GUI wrappers on non-open source platforms are themselves
-not open source.
+- 向 `relay-server` 分支 push 自动触发
+- 或手动：Actions → Build relay-server image → Run workflow
 
-## Building
+工作流包含三个作业：
 
-We always require the latest Go release, currently Go 1.26. (While we build
-releases with our [Go fork](https://github.com/tailscale/go/), its use is not
-required.)
+| 作业 | 作用 |
+| --- | --- |
+| `containerboot-test` | `go vet` + `go test ./cmd/containerboot`（信息性，`continue-on-error`，不挡镜像） |
+| `image` | 构建并推送多架构镜像，写入 run summary 摘要 |
+| `verify` | 拉回已发布镜像：跑 `tailscaled --version`、`tailscale version`，并检查 `containerboot` 里确实编进了 `TS_RELAY_SERVER_PORT`、`TS_RELAY_SERVER_STATIC_ENDPOINTS` |
 
+前置设置（已完成）：仓库 Actions 的 workflow 默认令牌权限需要 write，
+否则 `GITHUB_TOKEN` 无法推送 GHCR 包。
+
+## 在容器里跑 peer relay server
+
+```yaml
+services:
+  tailscale-relay:
+    image: ghcr.io/6d6d/tailscale-peer:relay-latest
+    restart: unless-stopped
+    network_mode: host            # 或显式映射 UDP 端口
+    environment:
+      TS_AUTHKEY: tskey-auth-xxxx  # 或用 TS_CLIENT_ID/TS_CLIENT_SECRET 等
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_HOSTNAME: relay-1
+      TS_RELAY_SERVER_PORT: "41641"   # UDP 端口，0 表示随机；设置了才启用 relay
+      # TS_RELAY_SERVER_STATIC_ENDPOINTS: "203.0.113.10:41641"  # 静态候选端点
+    volumes:
+      - ./tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add: [NET_ADMIN]
 ```
-go install tailscale.com/cmd/tailscale{,d}
+
+说明：
+
+- `TS_RELAY_SERVER_PORT` 一旦设置就启用 relay 功能，端口绑在所有接口的 UDP 上；
+  容器外部必须能访问该 UDP 端口（`network_mode: host` 或映射 `41641/udp`）。
+- `TS_RELAY_SERVER_STATIC_ENDPOINTS` 用于 relay 位于 NAT 后、需要对外宣告
+  `IP:端口` 候选的情况，多个用逗号分隔，IPv6 要写成 `[2001:db8::1]:41641`。
+- 把参数写进 `TS_EXTRA_ARGS` 也可以，containerboot 会把它们摘出来、改用
+  `tailscale set` 下发（`tailscale up` 不接受这两个参数）。
+- 非 `TS_AUTH_ONCE` 模式下，这两个设置在节点进入 Running 之后才应用；
+  `TS_AUTH_ONCE=true` 时随 `tailscale set` 一起下发。
+
+节点上核对：
+
+```sh
+tailscale get relay-server-port
+tailscale get relay-server-static-endpoints
+tailscale debug peer-relay-sessions     # 当前 relay 会话
+tailscale debug peer-relay-servers      # 已知的 relay 服务器
+tailscale status                        # 走 relay 的连接会标 peer-relay
 ```
 
-If you're packaging Tailscale for distribution, use `build_dist.sh`
-instead, to burn commit IDs and version info into the binaries:
+## 本地文件
 
-```
-./build_dist.sh tailscale.com/cmd/tailscale
-./build_dist.sh tailscale.com/cmd/tailscaled
-```
-
-If your distro has conventions that preclude the use of
-`build_dist.sh`, please do the equivalent of what it does in your
-distro's way, so that bug reports contain useful version information.
-
-## Bugs
-
-Please file any issues about this code or the hosted service on
-[the issue tracker](https://github.com/tailscale/tailscale/issues).
-
-## Contributing
-
-PRs welcome! But please file bugs. Commit messages should [reference
-bugs](https://docs.github.com/en/github/writing-on-github/autolinked-references-and-urls).
-
-We require [Developer Certificate of
-Origin](https://en.wikipedia.org/wiki/Developer_Certificate_of_Origin)
-`Signed-off-by` lines in commits.
-
-See [commit-messages.md](docs/commit-messages.md) (or skim `git log`) for our commit message style.
-
-## About Us
-
-[Tailscale](https://tailscale.com/) is primarily developed by the
-people at https://github.com/orgs/tailscale/people. For other contributors,
-see:
-
-* https://github.com/tailscale/tailscale/graphs/contributors
-* https://github.com/tailscale/tailscale-android/graphs/contributors
-
-## Legal
-
-WireGuard is a registered trademark of Jason A. Donenfeld.
+- `tailscale-peer-relay/`：仓库克隆（`origin` = 你的 fork，`truppelito` = 上游分支来源，
+  `upstream` = tailscale/tailscale）
+- `poll_runs.sh`：轮询 Actions 运行状态的脚本

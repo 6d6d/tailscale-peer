@@ -1,0 +1,168 @@
+# Builds a Tailscale container image from this fork, including
+#
+#   cmd/containerboot: support peer relay server configuration
+#   (TS_RELAY_SERVER_PORT / TS_RELAY_SERVER_STATIC_ENDPOINTS)
+#
+# Push to the relay-server branch (or run this workflow manually) to get a
+# multi-arch image in GHCR. The image is built with Dockerfile.relay, which
+# mirrors the official image build (binaries, ldflags, build tags, base
+# packages, entrypoint /usr/local/bin/containerboot).
+
+name: Build relay-server image
+
+on:
+  push:
+    branches:
+      - relay-server
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Target platforms, comma separated"
+        type: string
+        default: "linux/amd64,linux/arm64"
+      push_image:
+        description: "Push the built image to GHCR"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+concurrency:
+  group: relay-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Informational: this does not block the image build, so a flake in the Go
+  # toolchain setup or a test unrelated to the patch can't hold up a release.
+  containerboot-test:
+    name: containerboot tests (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet
+        run: go vet ./cmd/containerboot
+      - name: go test
+        run: go test -count=1 ./cmd/containerboot
+
+  image:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version stamps
+        id: meta
+        run: |
+          short="$(tr -d ' \t\r\n' < VERSION.txt)"
+          sha="$(git rev-parse --short=12 HEAD)"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "long=${short}-relay.${sha}" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=${short}-relay.${sha}" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' || inputs.push_image
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.relay
+          platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name == 'push' || inputs.push_image }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:relay-latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:relay-${{ steps.meta.outputs.short }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:relay-${{ steps.meta.outputs.long }}
+          build-args: |
+            VERSION_SHORT=${{ steps.meta.outputs.short }}
+            VERSION_LONG=${{ steps.meta.outputs.long }}
+            VERSION_GIT_HASH=${{ steps.meta.outputs.sha }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record digest
+        run: |
+          echo "image digest: ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Proves the published artifact is pullable, that each platform really
+  # contains that architecture's binaries, and that the peer relay server
+  # configuration is compiled into the containerboot in the image.
+  verify:
+    name: Verify published image
+    needs: image
+    if: github.event_name == 'push' || inputs.push_image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: docker/setup-qemu-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and inspect image
+        run: |
+          set -eux
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE }}:relay-latest"
+          docker pull "$IMG"
+          docker image inspect "$IMG" --format 'entrypoint={{json .Config.Entrypoint}} labels={{json .Config.Labels}}'
+
+      - name: Check each architecture
+        run: |
+          set -eu
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE }}:relay-latest"
+          for PLAT in amd64 arm64; do
+            case "$PLAT" in
+              amd64) WANT=3e00 ;;   # ELF e_machine x86-64
+              arm64) WANT=b700 ;;   # ELF e_machine aarch64
+            esac
+            echo "=== linux/$PLAT ==="
+            GOT=$(docker run --rm --platform "linux/$PLAT" --entrypoint /bin/sh "$IMG" \
+                    -c 'od -An -tx1 -j 18 -N 2 /usr/local/bin/containerboot | tr -d " \n"')
+            echo "containerboot e_machine=$GOT (want $WANT)"
+            [ "$GOT" = "$WANT" ] || { echo "wrong architecture binary in linux/$PLAT image"; exit 1; }
+            docker run --rm --platform "linux/$PLAT" --entrypoint /usr/local/bin/tailscaled "$IMG" --version
+            docker run --rm --platform "linux/$PLAT" --entrypoint /usr/local/bin/tailscale "$IMG" version
+            docker run --rm --platform "linux/$PLAT" --entrypoint /bin/sh \
+              -e WANT_PORT=TS_RELAY_SERVER_PORT \
+              -e WANT_EP=TS_RELAY_SERVER_STATIC_ENDPOINTS \
+              "$IMG" -c '
+                set -eu
+                for v in "$WANT_PORT" "$WANT_EP"; do
+                  n=$(tr -d "\000" < /usr/local/bin/containerboot | grep -c "$v" || true)
+                  echo "$v: $n occurrence(s)"
+                  [ "$n" -gt 0 ] || exit 1
+                done
+                echo "containerboot carries the peer relay server configuration"
+              '
+          done
+
+      - name: Summary
+        run: |
+          echo "Verified ${{ env.REGISTRY }}/${{ env.IMAGE }}:relay-latest on linux/amd64 and linux/arm64" >> "$GITHUB_STEP_SUMMARY"
