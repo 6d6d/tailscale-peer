@@ -1,0 +1,107 @@
+# Copyright (c) Tailscale Inc & contributors
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Fork-local image build for 6d6d/tailscale-peer (branch: relay-server-latest).
+#
+# Mirrors build_docker.sh's "client" target so the resulting image behaves like
+# the official tailscale/tailscale image (same binaries, ldflags, build tags,
+# base packages, entrypoint), but it is built from this fork's source, which
+# carries:
+#
+#   cmd/containerboot: support peer relay server configuration
+#   (TS_RELAY_SERVER_PORT / TS_RELAY_SERVER_STATIC_ENDPOINTS)
+#
+# Differences from ./Dockerfile:
+#   * the Go toolchain is the one pinned in go.toolchain.rev (tailscale/go),
+#     fetched per $BUILDPLATFORM exactly as upstream now does, so go.mod's
+#     requirement and the builder can never disagree;
+#   * the build stage runs on $BUILDPLATFORM and cross-compiles for
+#     $TARGETARCH, so multi-arch images are not built under QEMU emulation;
+#   * CGO is disabled explicitly: the build image has no C toolchain, and this
+#     is how Tailscale's own static builds are produced;
+#   * 'go build -o /out/' is used instead of 'go install', because 'go install'
+#     hides cross-compiled binaries in $GOBIN/$GOOS_$GOARCH and would leave
+#     nothing to copy for the non-native legs;
+#   * the runtime stage installs the same packages as Dockerfile.base (the
+#     recipe for the official tailscale/alpine-base image).
+
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS build-env
+
+WORKDIR /go/src/tailscale
+
+RUN apk add --no-cache curl tar
+COPY go.toolchain.rev ./
+RUN read -r REV <go.toolchain.rev && \
+    case "$(apk --print-arch)" in \
+        x86_64) ARCH=amd64 ;; \
+        aarch64) ARCH=arm64 ;; \
+        *) echo "unsupported architecture" >&2; exit 1 ;; \
+    esac && \
+    curl --retry 3 -f -L -o /tmp/go.tar.gz \
+      "https://github.com/tailscale/go/releases/download/build-${REV}/linux-${ARCH}.tar.gz" && \
+    mkdir -p /usr/local/go && \
+    tar -C /usr/local/go --strip-components=1 -xzf /tmp/go.tar.gz && \
+    rm /tmp/go.tar.gz
+
+ENV GOPATH=/go
+ENV PATH=/usr/local/go/bin:$GOPATH/bin:$PATH
+ENV GOTOOLCHAIN=local
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Pre-build some stuff before the following COPY line invalidates the Docker cache.
+RUN go install \
+    github.com/aws/aws-sdk-go-v2/aws \
+    github.com/aws/aws-sdk-go-v2/config \
+    gvisor.dev/gvisor/pkg/tcpip/adapters/gonet \
+    gvisor.dev/gvisor/pkg/tcpip/stack \
+    golang.org/x/crypto/ssh \
+    golang.org/x/crypto/acme \
+    github.com/coder/websocket \
+    github.com/mdlayher/netlink
+
+COPY . .
+
+ARG VERSION_LONG=""
+ENV VERSION_LONG=$VERSION_LONG
+ARG VERSION_SHORT=""
+ENV VERSION_SHORT=$VERSION_SHORT
+ARG VERSION_GIT_HASH=""
+ENV VERSION_GIT_HASH=$VERSION_GIT_HASH
+ARG TARGETARCH
+
+RUN mkdir -p /out && CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -o /out/ -ldflags="\
+      -X tailscale.com/version.longStamp=$VERSION_LONG \
+      -X tailscale.com/version.shortStamp=$VERSION_SHORT \
+      -X tailscale.com/version.gitCommitStamp=$VERSION_GIT_HASH" \
+      -tags="ts_kube,ts_package_container" \
+      -v ./cmd/tailscale ./cmd/tailscaled ./cmd/containerboot
+
+FROM alpine:3.22
+# Same package set as Dockerfile.base, the recipe for tailscale/alpine-base.
+RUN apk add --no-cache ca-certificates iptables iptables-legacy iproute2 ip6tables iputils
+# Alpine 3.19 replaced legacy iptables with nftables based implementation.
+# Tailscale is used on some hosts that don't support nftables, such as Synology
+# NAS, so link iptables back to legacy version. Hosts that don't require legacy
+# iptables should be able to use Tailscale in nftables mode.  See
+# https://github.com/tailscale/tailscale/issues/17854
+RUN rm /usr/sbin/iptables && ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables
+RUN rm /usr/sbin/ip6tables && ln -s /usr/sbin/ip6tables-legacy /usr/sbin/ip6tables
+
+COPY --from=build-env /out/tailscale /usr/local/bin/tailscale
+COPY --from=build-env /out/tailscaled /usr/local/bin/tailscaled
+COPY --from=build-env /out/containerboot /usr/local/bin/containerboot
+# For compat with the previous run.sh.
+RUN mkdir -p /tailscale && ln -s /usr/local/bin/containerboot /tailscale/run.sh
+
+ARG VERSION_SHORT=""
+ARG VERSION_GIT_HASH=""
+LABEL org.opencontainers.image.title="tailscale" \
+      org.opencontainers.image.description="tailscale built from 6d6d/tailscale-peer with containerboot peer relay server support" \
+      org.opencontainers.image.version="${VERSION_SHORT}" \
+      org.opencontainers.image.revision="${VERSION_GIT_HASH}" \
+      org.opencontainers.image.source="https://github.com/6d6d/tailscale-peer" \
+      org.opencontainers.image.licenses="BSD-3-Clause"
+
+ENTRYPOINT ["/usr/local/bin/containerboot"]
